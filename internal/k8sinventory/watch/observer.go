@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -22,7 +23,15 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sinventory"
 )
 
-const defaultResourceVersion = "1"
+const (
+	defaultResourceVersion       = "1"
+	resourceVersionRetryInterval = 10 * time.Second
+	resourceVersionRetryJitter   = 0.2
+)
+
+var getResourceVersionRetryDelay = func() time.Duration {
+	return wait.Jitter(resourceVersionRetryInterval, resourceVersionRetryJitter)
+}
 
 type Config struct {
 	k8sinventory.Config
@@ -92,7 +101,9 @@ func (o *Observer) startWatch(ctx context.Context, resource dynamic.ResourceInte
 			o.logger.Error("could not retrieve a resourceVersion",
 				zap.String("resource", o.config.Gvr.String()),
 				zap.Error(err))
-			cancel()
+			if !waitForResourceVersionRetry(newCtx, stopperChan) {
+				cancel()
+			}
 			return
 		}
 
@@ -105,6 +116,19 @@ func (o *Observer) startWatch(ctx context.Context, resource dynamic.ResourceInte
 		// need to restart with a fresh resource version
 		o.config.ResourceVersion = ""
 	}, 0)
+}
+
+func waitForResourceVersionRetry(ctx context.Context, stopperChan chan struct{}) bool {
+	timer := time.NewTimer(getResourceVersionRetryDelay())
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-stopperChan:
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // sendInitialState sends the current state of objects as synthetic Added events
@@ -164,21 +188,17 @@ func (o *Observer) doWatch(ctx context.Context, resourceVersion string, watchFun
 	for {
 		select {
 		case data, ok := <-res:
-			if data.Type == apiWatch.Error {
-				errObject := apierrors.FromObject(data.Object)
-				//nolint:errorlint
-				if errObject.(*apierrors.StatusError).ErrStatus.Code == http.StatusGone {
-					o.logger.Info("received a 410, grabbing new resource version",
-						zap.Any("data", data))
-					// we received a 410 so we need to restart
-					return false
-				}
-			}
-
 			if !ok {
 				o.logger.Warn("Watch channel closed unexpectedly",
 					zap.String("resource", o.config.Gvr.String()))
 				return true
+			}
+
+			if isExpiredResourceVersionEvent(data) {
+				o.logger.Info("received a 410, grabbing new resource version",
+					zap.Any("data", data))
+				// we received a 410 so we need to restart
+				return false
 			}
 
 			if o.config.Exclude[data.Type] {
@@ -196,6 +216,15 @@ func (o *Observer) doWatch(ctx context.Context, resourceVersion string, watchFun
 			return true
 		}
 	}
+}
+
+func isExpiredResourceVersionEvent(data apiWatch.Event) bool {
+	if data.Type != apiWatch.Error {
+		return false
+	}
+	errObject := apierrors.FromObject(data.Object)
+	statusErr, ok := errObject.(*apierrors.StatusError)
+	return ok && statusErr.ErrStatus.Code == http.StatusGone
 }
 
 func getResourceVersion(ctx context.Context, config k8sinventory.Config, resource dynamic.ResourceInterface) (string, error) {
