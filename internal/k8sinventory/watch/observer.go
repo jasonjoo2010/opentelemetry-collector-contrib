@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
+	"math"
 	"sync"
 	"time"
 
@@ -25,13 +25,11 @@ import (
 
 const (
 	defaultResourceVersion       = "1"
-	resourceVersionRetryInterval = 10 * time.Second
+	resourceVersionRetryInterval = 5 * time.Second
+	resourceVersionRetryCap      = 60 * time.Second
+	resourceVersionRetryFactor   = 2
 	resourceVersionRetryJitter   = 0.2
 )
-
-var getResourceVersionRetryDelay = func() time.Duration {
-	return wait.Jitter(resourceVersionRetryInterval, resourceVersionRetryJitter)
-}
 
 type Config struct {
 	k8sinventory.Config
@@ -45,7 +43,8 @@ type Observer struct {
 	client dynamic.Interface
 	logger *zap.Logger
 
-	handleWatchEventFunc func(event *apiWatch.Event)
+	handleWatchEventFunc        func(event *apiWatch.Event)
+	resourceVersionRetryBackoff wait.Backoff
 }
 
 func New(client dynamic.Interface, config Config, logger *zap.Logger, handleWatchEventFunc func(event *apiWatch.Event)) (*Observer, error) {
@@ -54,6 +53,13 @@ func New(client dynamic.Interface, config Config, logger *zap.Logger, handleWatc
 		config:               config,
 		logger:               logger,
 		handleWatchEventFunc: handleWatchEventFunc,
+		resourceVersionRetryBackoff: wait.Backoff{
+			Duration: resourceVersionRetryInterval,
+			Factor:   resourceVersionRetryFactor,
+			Jitter:   resourceVersionRetryJitter,
+			Cap:      resourceVersionRetryCap,
+			Steps:    math.MaxInt32,
+		},
 	}
 	return o, nil
 }
@@ -96,14 +102,12 @@ func (o *Observer) startWatch(ctx context.Context, resource dynamic.ResourceInte
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	wait.UntilWithContext(cancelCtx, func(newCtx context.Context) {
-		resourceVersion, err := getResourceVersion(newCtx, o.config.Config, resource)
+		resourceVersion, err := o.getResourceVersionWithRetry(newCtx, o.config.Config, resource, stopperChan)
 		if err != nil {
 			o.logger.Error("could not retrieve a resourceVersion",
 				zap.String("resource", o.config.Gvr.String()),
 				zap.Error(err))
-			if !waitForResourceVersionRetry(newCtx, stopperChan) {
-				cancel()
-			}
+			cancel()
 			return
 		}
 
@@ -118,16 +122,38 @@ func (o *Observer) startWatch(ctx context.Context, resource dynamic.ResourceInte
 	}, 0)
 }
 
-func waitForResourceVersionRetry(ctx context.Context, stopperChan chan struct{}) bool {
-	timer := time.NewTimer(getResourceVersionRetryDelay())
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-stopperChan:
-		return false
-	case <-timer.C:
-		return true
+// getResourceVersionWithRetry retries getResourceVersion using an exponential
+// backoff until it succeeds, the context is cancelled, or the stopper is signaled.
+func (o *Observer) getResourceVersionWithRetry(ctx context.Context, config k8sinventory.Config, resource dynamic.ResourceInterface, stopperChan chan struct{}) (string, error) {
+	backoff := o.resourceVersionRetryBackoff
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-stopperChan:
+			return "", context.Canceled
+		default:
+		}
+
+		resourceVersion, err := getResourceVersion(ctx, config, resource)
+		if err == nil {
+			return resourceVersion, nil
+		}
+
+		o.logger.Warn("could not retrieve a resourceVersion, will retry",
+			zap.String("resource", o.config.Gvr.String()),
+			zap.Error(err))
+
+		timer := time.NewTimer(backoff.Step())
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-stopperChan:
+			timer.Stop()
+			return "", context.Canceled
+		case <-timer.C:
+		}
 	}
 }
 
@@ -223,8 +249,7 @@ func isExpiredResourceVersionEvent(data apiWatch.Event) bool {
 		return false
 	}
 	errObject := apierrors.FromObject(data.Object)
-	statusErr, ok := errObject.(*apierrors.StatusError)
-	return ok && statusErr.ErrStatus.Code == http.StatusGone
+	return apierrors.IsResourceExpired(errObject) || apierrors.IsGone(errObject)
 }
 
 func getResourceVersion(ctx context.Context, config k8sinventory.Config, resource dynamic.ResourceInterface) (string, error) {
@@ -236,6 +261,7 @@ func getResourceVersion(ctx context.Context, config k8sinventory.Config, resourc
 		objects, err := resource.List(ctx, metav1.ListOptions{
 			FieldSelector: config.FieldSelector,
 			LabelSelector: config.LabelSelector,
+			Limit:         1,
 		})
 		if err != nil {
 			return "", fmt.Errorf("could not perform initial list for watch on %v, %w", config.Gvr.String(), err)
